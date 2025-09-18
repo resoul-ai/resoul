@@ -1,13 +1,16 @@
 from __future__ import annotations
+
 import logging
 import sys
-from pathlib import Path
 from os import getenv
+from pathlib import Path
 
 import click
 import torch
-from TTS.api import TTS # xtts lib has non-commercial license, so resoul doesn't re-export for customizing
 from dotenv import load_dotenv
+from TTS.api import (
+    TTS,  # xtts lib has non-commercial license, so resoul doesn't re-export for customizing
+)
 
 from resoul.tts_api import OpenVoice
 
@@ -20,10 +23,10 @@ logging.basicConfig(
 # Default values
 # Load environment variables from .env file
 load_dotenv()
-CKPT_BASE = getenv('CKPT_BASE')
-CKPT_CONVERTER = getenv('CKPT_CONVERTER')
-OUTPUT_DIR = getenv('OUTPUT_DIR', 'default_output_dir')
-DEFAULT_REFERENCE_SPEAKER = getenv('DEFAULT_REFERENCE_SPEAKER')
+CKPT_BASE = getenv("CKPT_BASE")
+CKPT_CONVERTER = getenv("CKPT_CONVERTER")
+OUTPUT_DIR = getenv("OUTPUT_DIR", "default_output_dir")
+DEFAULT_REFERENCE_SPEAKER = getenv("DEFAULT_REFERENCE_SPEAKER")
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -33,23 +36,36 @@ def cli():
     """Main CLI group"""
     pass
 
+
 @cli.group()
 def xtts():
     """XTTS voice synthesis commands"""
     pass
+
 
 @cli.group()
 def openvoice():
     """OpenVoice synthesis commands"""
     pass
 
+
 class TTSBackend:
     """converts text to speech (files)"""
-    def __call__(self, text:str, output_path: str, reference_audio_path: str, **kwargs)->None:
-        ...
+
+    def __call__(
+        self, text: str, output_path: str, reference_audio_path: str, **kwargs
+    ) -> None: ...
+
 
 class OpenVoiceBackend(TTSBackend):
-    def __init__(self, ckpt_base: Path, ckpt_converter: Path, device: str, output_dir: Path, **kwargs):
+    def __init__(
+        self,
+        ckpt_base: Path,
+        ckpt_converter: Path,
+        device: str,
+        output_dir: Path,
+        **kwargs,
+    ):
         self.openvoice = OpenVoice(
             ckpt_base=ckpt_base,
             ckpt_converter=ckpt_converter,
@@ -57,8 +73,17 @@ class OpenVoiceBackend(TTSBackend):
             output_dir=output_dir,
         )
 
-    def __call__(self, text: str, output_path: str, reference_audio_path: str, speaker: str = "default", 
-                 language: str = "English", speed: float = 1.0, encode_message: str = "@MyShell", **kwargs) -> None:
+    def __call__(
+        self,
+        text: str,
+        output_path: str,
+        reference_audio_path: str,
+        speaker: str = "default",
+        language: str = "English",
+        speed: float = 1.0,
+        encode_message: str = "@MyShell",
+        **kwargs,
+    ) -> None:
         self.openvoice.process_tts(
             text=text,
             output_filename=output_path,
@@ -71,18 +96,28 @@ class OpenVoiceBackend(TTSBackend):
 
 
 class XTTSBackend(TTSBackend):
-    def __init__(self, model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2", progress_bar: bool = False, device: bool = True, **kwargs):
-        self.tts = TTS(model_name=model_name, progress_bar=progress_bar, gpu=device, **kwargs)
-
-    def __call__(self, text: str, output_path: str, reference_audio_path: str, **kwargs)->None:
-        self.tts.tts_to_file(
-            text=text,
-            file_path=output_path,
-            speaker_wav=reference_audio_path,
-            **kwargs
+    def __init__(
+        self,
+        model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2",
+        progress_bar: bool = False,
+        device: bool = True,
+        **kwargs,
+    ):
+        self.tts = TTS(
+            model_name=model_name, progress_bar=progress_bar, gpu=device, **kwargs
         )
 
-def process_input(tts: TTSBackend, input_path: Path, output_dir: Path, **kwargs) -> None:
+    def __call__(
+        self, text: str, output_path: str, reference_audio_path: str, **kwargs
+    ) -> None:
+        self.tts.tts_to_file(
+            text=text, file_path=output_path, speaker_wav=reference_audio_path, **kwargs
+        )
+
+
+def process_input(
+    tts: TTSBackend, input_path: Path, output_dir: Path, **kwargs
+) -> None:
     """Process input file(s) and generate speech"""
     input_path = Path(input_path)
     output_dir = Path(output_dir)
@@ -92,7 +127,8 @@ def process_input(tts: TTSBackend, input_path: Path, output_dir: Path, **kwargs)
     if input_path.is_file():
         files = [input_path]
     else:
-        files = list(input_path.glob("**/*.txt"))
+        # files = list(input_path.glob("**/*.txt"))
+        files = list(input_path.glob("**/*"))
 
     if not files:
         click.echo(f"No .txt files found in {input_path}")
@@ -121,24 +157,65 @@ def process_input(tts: TTSBackend, input_path: Path, output_dir: Path, **kwargs)
 
 
 @openvoice.command()
-@click.argument("input-dir", required=True, type=click.Path(exists=True))#, help="Directory containing input text files")
-@click.argument("output-dir", type=click.Path(), default=OUTPUT_DIR)#, help="Output directory for generated audio")
-@click.option("--reference-audio-path", default=DEFAULT_REFERENCE_SPEAKER, help="Path to the reference speaker audio file")
-@click.option("--speaker", default="default", help="Base speaker for initial TTS generation")
+@click.argument(
+    "input-dir", required=True, type=click.Path(exists=True)
+)  # , help="Directory containing input text files")
+@click.argument(
+    "output-dir", type=click.Path(), default=OUTPUT_DIR
+)  # , help="Output directory for generated audio")
+@click.option(
+    "--reference-audio-path",
+    default=DEFAULT_REFERENCE_SPEAKER,
+    help="Path to the reference speaker audio file",
+)
+@click.option(
+    "--speaker", default="default", help="Base speaker for initial TTS generation"
+)
 @click.option("--language", default="English", help="Language of the input text")
-@click.option("--speed", default=1.0, type=float, help="Speed of speech generation (1.0 is normal)")
-@click.option("--encode-message", default="@MyShell", help="Message to encode in the output audio")
-@click.option("--ckpt-base", type=click.Path(), default=CKPT_BASE, help="Path to the base checkpoint directory")
-@click.option("--ckpt-converter", type=click.Path(), default=CKPT_CONVERTER, help="Path to the converter checkpoint directory")
-@click.option("--device", default=DEVICE, help="Device to use for processing (e.g., 'cuda:0', 'cpu')")
-def files(input_dir: str, reference_audio_path: str, speaker: str, language: str, speed: float,
-                  encode_message: str, output_dir: Path, ckpt_base: Path, ckpt_converter: Path, device: str) -> None:
+@click.option(
+    "--speed",
+    default=1.0,
+    type=float,
+    help="Speed of speech generation (1.0 is normal)",
+)
+@click.option(
+    "--encode-message", default="@MyShell", help="Message to encode in the output audio"
+)
+@click.option(
+    "--ckpt-base",
+    type=click.Path(),
+    default=CKPT_BASE,
+    help="Path to the base checkpoint directory",
+)
+@click.option(
+    "--ckpt-converter",
+    type=click.Path(),
+    default=CKPT_CONVERTER,
+    help="Path to the converter checkpoint directory",
+)
+@click.option(
+    "--device",
+    default=DEVICE,
+    help="Device to use for processing (e.g., 'cuda:0', 'cpu')",
+)
+def files(
+    input_dir: str,
+    reference_audio_path: str,
+    speaker: str,
+    language: str,
+    speed: float,
+    encode_message: str,
+    output_dir: Path,
+    ckpt_base: Path,
+    ckpt_converter: Path,
+    device: str,
+) -> None:
     """Generate speech from all text files in the input directory using OpenVoice v1 model."""
     engine = OpenVoiceBackend(
         ckpt_base=ckpt_base,
         ckpt_converter=ckpt_converter,
         device=device,
-        output_dir=output_dir
+        output_dir=output_dir,
     )
     process_input(
         tts=engine,
@@ -148,28 +225,66 @@ def files(input_dir: str, reference_audio_path: str, speaker: str, language: str
         speaker=speaker,
         language=language,
         speed=speed,
-        encode_message=encode_message
+        encode_message=encode_message,
     )
+
 
 @openvoice.command()
 @click.argument("text", required=True)
 @click.argument("output-path", type=click.Path())
-@click.option("--reference-audio-path", default=DEFAULT_REFERENCE_SPEAKER, help="Path to the reference speaker audio file")
-@click.option("--speaker", default="default", help="Base speaker for initial TTS generation")
+@click.option(
+    "--reference-audio-path",
+    default=DEFAULT_REFERENCE_SPEAKER,
+    help="Path to the reference speaker audio file",
+)
+@click.option(
+    "--speaker", default="default", help="Base speaker for initial TTS generation"
+)
 @click.option("--language", default="English", help="Language of the input text")
-@click.option("--speed", default=1.0, type=float, help="Speed of speech generation (1.0 is normal)")
-@click.option("--encode-message", default="@MyShell", help="Message to encode in the output audio")
-@click.option("--ckpt-base", type=click.Path(), default=CKPT_BASE, help="Path to the base checkpoint directory")
-@click.option("--ckpt-converter", type=click.Path(), default=CKPT_CONVERTER, help="Path to the converter checkpoint directory")
-@click.option("--device", default=DEVICE, help="Device to use for processing (e.g., 'cuda:0', 'cpu')")
-def query(text: str, output_path: str, reference_audio_path: str, speaker: str, language: str, speed: float,
-         encode_message: str, ckpt_base: Path, ckpt_converter: Path, device: str) -> None:
+@click.option(
+    "--speed",
+    default=1.0,
+    type=float,
+    help="Speed of speech generation (1.0 is normal)",
+)
+@click.option(
+    "--encode-message", default="@MyShell", help="Message to encode in the output audio"
+)
+@click.option(
+    "--ckpt-base",
+    type=click.Path(),
+    default=CKPT_BASE,
+    help="Path to the base checkpoint directory",
+)
+@click.option(
+    "--ckpt-converter",
+    type=click.Path(),
+    default=CKPT_CONVERTER,
+    help="Path to the converter checkpoint directory",
+)
+@click.option(
+    "--device",
+    default=DEVICE,
+    help="Device to use for processing (e.g., 'cuda:0', 'cpu')",
+)
+def query(
+    text: str,
+    output_path: str,
+    reference_audio_path: str,
+    speaker: str,
+    language: str,
+    speed: float,
+    encode_message: str,
+    ckpt_base: Path,
+    ckpt_converter: Path,
+    device: str,
+) -> None:
     """Generate speech from text using OpenVoice v1 model."""
     engine = OpenVoiceBackend(
         ckpt_base=ckpt_base,
         ckpt_converter=ckpt_converter,
         device=device,
-        output_dir=Path(output_path).parent
+        output_dir=Path(output_path).parent,
     )
     engine(
         text=text,
@@ -178,8 +293,9 @@ def query(text: str, output_path: str, reference_audio_path: str, speaker: str, 
         speaker=speaker,
         language=language,
         speed=speed,
-        encode_message=encode_message
+        encode_message=encode_message,
     )
+
 
 @xtts.command()
 @click.argument("input-path", type=click.Path(exists=True))
@@ -187,16 +303,151 @@ def query(text: str, output_path: str, reference_audio_path: str, speaker: str, 
 @click.option("--reference-audio-path", help="Path to speaker reference audio")
 @click.option("--language", default="en", help="Language code")
 @click.option("--device", default=DEVICE, help="Device for processing (cuda:0, cpu)")
-def files(input_path: str, output_dir: str, reference_audio_path: str, language: str, device: str):
+def mp_files(
+    input_path: Path,
+    output_dir: Path,
+    reference_audio_path: Path,
+    language: str,
+    device: str,
+):
+    """Generate speech using XTTS v2 via mp for multiple files"""
+    from resoul.mp_utils import process_tts_chapters
+
+    process_tts_chapters(
+        chapters_directory=Path(input_path),
+        output_dir=Path(output_dir),
+        num_workers=5,
+        model="tts_models/multilingual/multi-dataset/xtts_v2",
+        speaker=reference_audio_path,
+    )
+
+
+@xtts.command()
+@click.argument("input-path", type=click.Path(exists=True))
+@click.argument("output-dir", type=click.Path())
+@click.argument("num-workers", type=int)
+@click.option("--reference-audio-path", help="Path to speaker reference audio")
+@click.option("--language", default="en", help="Language code")
+@click.option("--device", default=DEVICE, help="Device for processing (cuda:0, cpu)")
+def mp_file(
+    input_path: Path,
+    output_dir: Path,
+    num_workers: int,
+    reference_audio_path: Path,
+    language: str,
+    device: str,
+):
+    """Generate speech using XTTS v2 via mp for multiple files"""
+    import os
+    import re
+    import string
+    import tempfile
+    import time
+
+    from pydub import AudioSegment
+
+    from resoul.mp_utils import process_tts_chapters, split_sentence
+
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+
+    start_time = time.time()
+
+    # meaningful splice the chapter and save to that directory (with order conserved in title)
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = "".join(f.readlines())
+        # NOTE: split length could probably be increased or just pass more sentences into a given worker
+        text = split_sentence(text, lang="en", text_split_length=399)
+        # here you have a list of sentences that was split intelligently
+        text = [sentence.lstrip() for sentence in text]
+        # Filter out strings that contain only punctuation
+        text = [s for s in text if not all(c in string.punctuation for c in s)]
+        # TODO: we should remove empty / only punctuation sentences? or maybe thats just from inside the tts processing code from coqui: eg
+        # sentence: '’', its a coqui parsing issue
+
+    # create a temporary directory for individual subsection of a given chapter
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        for i, sent in enumerate(text):
+            file_path = tmpdir / Path(str(i))
+            file_path.write_text(sent)
+
+        # then run process_tts_chapters on that directory as the chapters directory (rename that function later)
+
+        output_tmpdir = tmpdir / Path("output")
+        output_tmpdir.mkdir()
+        process_tts_chapters(
+            chapters_directory=Path(tmpdir),
+            output_dir=Path(output_tmpdir),
+            num_workers=num_workers,
+            model="tts_models/multilingual/multi-dataset/xtts_v2",
+            speaker=reference_audio_path,
+        )
+
+        # recombine contents of outputdir to just one
+        # read in the folder, order the files numerically, and combine
+
+        # Step 1: Read files from the directory
+        files = [
+            f for f in os.listdir(output_tmpdir) if f.endswith((".mp3", ".wav"))
+        ]  # Adjust extensions as needed
+
+        # Step 2: Sort files numerically by filename (assuming filenames are numbers)
+        reference_stem = Path(reference_audio_path).stem
+        def extract_number_from_audio_file(filename):
+            """Extract number from audio filename for proper sorting"""
+            try:
+                match = re.search(rf"{re.escape(reference_stem)}-(\d+)\.wav", filename)
+                if match:
+                    return int(match.group(1))
+                # Fallback: extract any number from filename
+                number_match = re.search(r'(\d+)', filename)
+                return int(number_match.group(1)) if number_match else float('inf')
+            except (ValueError, AttributeError):
+                return float('inf')
+
+        files.sort(key=extract_number_from_audio_file)
+
+        # Step 3: Load and recombine audio files
+        combined_audio = AudioSegment.empty()
+
+        for file in files:
+            file_path = os.path.join(output_tmpdir, file)
+            audio = AudioSegment.from_file(file_path)
+            combined_audio += audio  # Concatenate audio
+
+    # Step 4: Export the combined audio
+    output_file = output_dir / f"{input_path.stem}.wav"
+    combined_audio.export(output_file, format="wav")  # Change format if needed
+    print(f"Combined audio saved to {output_file}")
+    processing_time = time.time() - start_time
+    print(f"total processing time: {processing_time}")
+    print(f"rtf: { processing_time / combined_audio.duration_seconds}")
+
+
+@xtts.command()
+@click.argument("input-path", type=click.Path(exists=True))
+@click.argument("output-dir", type=click.Path())
+@click.option("--reference-audio-path", help="Path to speaker reference audio")
+@click.option("--language", default="en", help="Language code")
+@click.option("--device", default=DEVICE, help="Device for processing (cuda:0, cpu)")
+def files(
+    input_path: str,
+    output_dir: str,
+    reference_audio_path: str,
+    language: str,
+    device: str,
+):
     """Generate speech using XTTS v2"""
-    engine = XTTSBackend( device=device != "cpu")
+    engine = XTTSBackend(device=device != "cpu")
     process_input(
         tts=engine,
         input_path=input_path,
         output_dir=output_dir,
         reference_audio_path=reference_audio_path,
-        language=language
+        language=language,
     )
+
 
 @xtts.command()
 @click.argument("text", required=True)
@@ -204,10 +455,18 @@ def files(input_path: str, output_dir: str, reference_audio_path: str, language:
 @click.option("--reference-audio-path", help="Path to speaker reference audio")
 @click.option("--language", default="en", help="Language code")
 @click.option("--device", default=DEVICE, help="Device for processing (cuda:0, cpu)")
-def query(text: str, output_path: str, reference_audio_path: str, language: str, device: str):
+def query(
+    text: str, output_path: str, reference_audio_path: str, language: str, device: str
+):
     """Generate speech using XTTS v2"""
     engine = XTTSBackend(device=device != "cpu")
-    engine(text, output_path=output_path, reference_audio_path=reference_audio_path, language=language)
+    engine(
+        text,
+        output_path=output_path,
+        reference_audio_path=reference_audio_path,
+        language=language,
+    )
+
 
 if __name__ == "__main__":
     cli(prog_name="resoul")

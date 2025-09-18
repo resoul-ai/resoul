@@ -69,4 +69,4 @@ Known Bugs
   a word (openvoice-v1 model specifically)
 - sufficiently large files will TTS fine but fail during conversion (if you use a rvc library, for e.g.)
   step (e.g. 2hr chapter fails). 
-
+- generated chapters in no particular order. not a bug, per se. but silly that we haven't updated this.

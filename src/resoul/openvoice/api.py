@@ -63,6 +63,7 @@ class BaseSpeakerTTS(OpenVoiceBaseClass):
         audio_segments = np.array(audio_segments).astype(np.float32)
         return audio_segments
 
+    # NOTE: this "text splitted to sentences" exists similarly in both xtts (coqui) and openvoice codebase
     @staticmethod
     def split_sentences_into_pieces(text, language_str):
         texts = utils.split_sentence(text, language_str=language_str)

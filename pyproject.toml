@@ -28,5 +28,5 @@ dependencies = [
     'gradio==3.48.0',
     'langid==1.1.6',
     'TTS',
-    'python-dotenv'
+    'python-dotenv',
 ]
