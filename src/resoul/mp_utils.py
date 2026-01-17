@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import os
 import re
 import textwrap
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -36,14 +37,14 @@ def extract_chapter_number(filename: str) -> tuple[int, str]:
 
     # Pattern 2: Extract number from various chapter formats
     patterns = [
-        r'chapter[_-]?(\d+)',     # chapter1, chapter-1, chapter_01
-        r'chap[_-]?(\d+)',        # chap1, chap-01
-        r'ch[_-]?(\d+)',          # ch1, ch-10
-        r'part[_-]?(\d+)',        # part1, part-2
-        r'(\d+)[_-]?chapter',     # 1chapter, 01-chapter
-        r'(\d+)[_-]?ch',          # 1ch, 01-ch
-        r'(\d{1,4})$',            # ends with 1-4 digits
-        r'(\d+)',                 # any number in filename
+        r"chapter[_-]?(\d+)",  # chapter1, chapter-1, chapter_01
+        r"chap[_-]?(\d+)",  # chap1, chap-01
+        r"ch[_-]?(\d+)",  # ch1, ch-10
+        r"part[_-]?(\d+)",  # part1, part-2
+        r"(\d+)[_-]?chapter",  # 1chapter, 01-chapter
+        r"(\d+)[_-]?ch",  # 1ch, 01-ch
+        r"(\d{1,4})$",  # ends with 1-4 digits
+        r"(\d+)",  # any number in filename
     ]
 
     for pattern in patterns:
@@ -52,7 +53,7 @@ def extract_chapter_number(filename: str) -> tuple[int, str]:
             return (int(match.group(1)), filename)
 
     # Fallback: no number found, sort to end
-    return (float('inf'), filename)
+    return (float("inf"), filename)
 
 
 def get_spacy_lang(lang):
@@ -105,6 +106,8 @@ def process_tts_chapters(
     num_workers: int,
     model: str,
     speaker: str,
+    num_gpus: int = 2,
+    workers_per_gpu: int = 1,
     # replacements_yml_filepath: Path,
 ) -> list[str]:
     """
@@ -115,11 +118,16 @@ def process_tts_chapters(
     :param output_dir: The directory where output audio files will be saved
     :type output_dir: Path
     :param num_workers: The number of worker processes to use for parallel processing
+        (kept for backward compatibility, ignored when num_gpus > 1)
     :type num_workers: int
     :param model: The name of the TTS model to use
     :type model: str
     :param speaker: The ID or path of the speaker voice to use
     :type speaker: str
+    :param num_gpus: The number of GPUs to use for parallel processing (default: 2)
+    :type num_gpus: int
+    :param workers_per_gpu: The number of worker processes per GPU (default: 1)
+    :type workers_per_gpu: int
     :param replacements_yml_filepath: The path to a YAML file containing text replacement rules
     :type replacements_yml_filepath: Path
     :return: A list of paths to the generated audio files
@@ -136,7 +144,7 @@ def process_tts_chapters(
     logging.info("Chapter processing order:")
     for i, chapter in enumerate(chapters):
         chapter_num, _ = extract_chapter_number(chapter.name)
-        logging.info(f"  {i+1}. {chapter.name} (extracted number: {chapter_num})")
+        logging.info(f"  {i + 1}. {chapter.name} (extracted number: {chapter_num})")
 
     texts = {}
     for chapter_file in chapters:
@@ -147,7 +155,9 @@ def process_tts_chapters(
             # text = preprocess(sentences=text, config=preprocess_config)
             texts[chapter_file.stem] = "\n".join(text)
 
-    return parallel_tts_inference(texts, output_dir, num_workers, model, speaker)
+    return parallel_tts_inference(
+        texts, output_dir, num_workers, model, speaker, num_gpus, workers_per_gpu
+    )
 
 
 def parallel_tts_inference(
@@ -156,20 +166,27 @@ def parallel_tts_inference(
     num_workers: int,
     model_name: str,
     speaker_id: str,
+    num_gpus: int = 2,
+    workers_per_gpu: int = 1,
 ) -> list[str]:
     """
-    Process multiple texts in parallel using TTS inference.
+    Process multiple texts in parallel using TTS inference across multiple GPUs.
 
     :param texts: A dictionary of texts to process, where keys are identifiers and values are the texts
     :type texts: dict[str, str]
     :param output_dir: The directory where output audio files will be saved
     :type output_dir: Path
     :param num_workers: The number of worker processes to use for parallel processing
+        (kept for backward compatibility, ignored when num_gpus > 1)
     :type num_workers: int
     :param model_name: The name of the TTS model to use
     :type model_name: str
     :param speaker_id: The ID or path of the speaker voice to use
     :type speaker_id: str
+    :param num_gpus: The number of GPUs to use for parallel processing (default: 2)
+    :type num_gpus: int
+    :param workers_per_gpu: The number of worker processes per GPU (default: 1)
+    :type workers_per_gpu: int
     :return: A list of paths to the generated audio files
     :rtype: list[str]
     """
@@ -178,24 +195,49 @@ def parallel_tts_inference(
 
     multiprocessing.set_start_method("spawn", force=True)
 
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [
-            executor.submit(
-                tts_worker,
-                text,
-                str(output_dir / f"{name}-{source_file}.wav"),
-                model_name,
-                speaker_id,
-            )
-            for source_file, text in texts.items()
-        ]
+    # Split texts across GPUs in round-robin fashion
+    text_items = list(texts.items())
+    gpu_batches: list[list[tuple[str, str]]] = [[] for _ in range(num_gpus)]
+    for i, item in enumerate(text_items):
+        gpu_batches[i % num_gpus].append(item)
 
-        results = [future.result() for future in as_completed(futures)]
+    logging.info(f"Distributing {len(text_items)} items across {num_gpus} GPUs")
+    for gpu_id, batch in enumerate(gpu_batches):
+        logging.info(f"  GPU {gpu_id}: {len(batch)} items")
+
+    all_futures = []
+    executors: list[ProcessPoolExecutor] = []
+
+    try:
+        # Create a separate process pool for each GPU
+        for gpu_id in range(num_gpus):
+            executor = ProcessPoolExecutor(max_workers=workers_per_gpu)
+            executors.append(executor)
+
+            for source_file, text in gpu_batches[gpu_id]:
+                future = executor.submit(
+                    tts_worker,
+                    text,
+                    str(output_dir / f"{name}-{source_file}.wav"),
+                    model_name,
+                    speaker_id,
+                    gpu_id,
+                )
+                all_futures.append(future)
+
+        results = [future.result() for future in as_completed(all_futures)]
+
+    finally:
+        # Ensure all executors are properly shut down
+        for executor in executors:
+            executor.shutdown(wait=True)
 
     return results
 
 
-def tts_worker(text: str, output_file: str, model_name: str, speaker_id: str) -> str:
+def tts_worker(
+    text: str, output_file: str, model_name: str, speaker_id: str, gpu_id: int = 0
+) -> str:
     """
     Generate audio from text using a TTS model and save it to a file.
 
@@ -207,11 +249,16 @@ def tts_worker(text: str, output_file: str, model_name: str, speaker_id: str) ->
     :type model_name: str
     :param speaker_id: The ID or path of the speaker voice to use
     :type speaker_id: str
+    :param gpu_id: The GPU device ID to use for this worker (default: 0)
+    :type gpu_id: int
     :return: The path of the saved audio file
     :rtype: str
     """
+    # Set which GPU this worker should use before loading the model
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     tts = TTS(model_name=model_name, progress_bar=False, gpu=True)
-    logging.info("saving to %s", output_file)
+    logging.info("saving to %s on GPU %d", output_file, gpu_id)
     tts.tts_to_file(
         text=text,
         file_path=output_file,

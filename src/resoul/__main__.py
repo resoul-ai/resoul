@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from os import getenv
 from pathlib import Path
@@ -13,6 +14,8 @@ from TTS.api import (
 )
 
 from resoul.tts_api import OpenVoice
+
+os.environ["COQUI_TOS_AGREED"] = "1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -303,23 +306,38 @@ def query(
 @click.option("--reference-audio-path", help="Path to speaker reference audio")
 @click.option("--language", default="en", help="Language code")
 @click.option("--device", default=DEVICE, help="Device for processing (cuda:0, cpu)")
+@click.option("--gpus", type=int, default=2, help="Number of GPUs to use")
+@click.option("--workers-per-gpu", type=int, default=1, help="Workers per GPU")
 def mp_files(
     input_path: Path,
     output_dir: Path,
     reference_audio_path: Path,
     language: str,
     device: str,
+    gpus: int,
+    workers_per_gpu: int,
 ):
     """Generate speech using XTTS v2 via mp for multiple files"""
     from resoul.mp_utils import process_tts_chapters
 
+    # Explicitly set GPU count
     process_tts_chapters(
-        chapters_directory=Path(input_path),
-        output_dir=Path(output_dir),
-        num_workers=5,
+        Path(input_path),
+        Path(output_dir),
+        num_workers=2,
         model="tts_models/multilingual/multi-dataset/xtts_v2",
         speaker=reference_audio_path,
+        num_gpus=gpus,
+        workers_per_gpu=workers_per_gpu,
     )
+
+    # process_tts_chapters(
+    #     chapters_directory=Path(input_path),
+    #     output_dir=Path(output_dir),
+    #     num_workers=5,
+    #     model="tts_models/multilingual/multi-dataset/xtts_v2",
+    #     speaker=reference_audio_path,
+    # )
 
 
 @xtts.command()
@@ -394,6 +412,7 @@ def mp_file(
 
         # Step 2: Sort files numerically by filename (assuming filenames are numbers)
         reference_stem = Path(reference_audio_path).stem
+
         def extract_number_from_audio_file(filename):
             """Extract number from audio filename for proper sorting"""
             try:
@@ -401,10 +420,10 @@ def mp_file(
                 if match:
                     return int(match.group(1))
                 # Fallback: extract any number from filename
-                number_match = re.search(r'(\d+)', filename)
-                return int(number_match.group(1)) if number_match else float('inf')
+                number_match = re.search(r"(\d+)", filename)
+                return int(number_match.group(1)) if number_match else float("inf")
             except (ValueError, AttributeError):
-                return float('inf')
+                return float("inf")
 
         files.sort(key=extract_number_from_audio_file)
 
@@ -422,7 +441,7 @@ def mp_file(
     print(f"Combined audio saved to {output_file}")
     processing_time = time.time() - start_time
     print(f"total processing time: {processing_time}")
-    print(f"rtf: { processing_time / combined_audio.duration_seconds}")
+    print(f"rtf: {processing_time / combined_audio.duration_seconds}")
 
 
 @xtts.command()
