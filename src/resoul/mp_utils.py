@@ -4,17 +4,41 @@ import logging
 import multiprocessing
 import os
 import re
+import tempfile
 import textwrap
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
+from pydub import AudioSegment
 from spacy.lang.en import English
-from TTS.api import (
-    TTS,  # xtts lib has non-commercial license, so resoul doesn't re-export for customizing
-)
+
+# Use explicit spawn context to avoid CUDA issues with fork
+# This ensures child processes don't inherit parent's CUDA state
+_mp_context = multiprocessing.get_context("spawn")
 
 
-def extract_chapter_number(filename: str) -> tuple[int, str]:
+@dataclass
+class ChunkTask:
+    """A single TTS work unit."""
+
+    chapter_name: str
+    chunk_index: int
+    text: str
+    output_path: str
+
+
+@dataclass
+class ChunkResult:
+    """Result from processing a chunk."""
+
+    chapter_name: str
+    chunk_index: int
+    output_path: str
+    success: bool
+    error: str | None = None
+
+
+def extract_chapter_number(filename: str) -> tuple[int | float, str]:
     """
     Extract chapter number from filename for proper sorting.
 
@@ -28,23 +52,20 @@ def extract_chapter_number(filename: str) -> tuple[int, str]:
     Returns:
         tuple: (chapter_number, original_filename) for sorting
     """
-    # Remove file extension
     stem = Path(filename).stem.lower()
 
-    # Pattern 1: Pure number (most common for mp_file command)
     if stem.isdigit():
         return (int(stem), filename)
 
-    # Pattern 2: Extract number from various chapter formats
     patterns = [
-        r"chapter[_-]?(\d+)",  # chapter1, chapter-1, chapter_01
-        r"chap[_-]?(\d+)",  # chap1, chap-01
-        r"ch[_-]?(\d+)",  # ch1, ch-10
-        r"part[_-]?(\d+)",  # part1, part-2
-        r"(\d+)[_-]?chapter",  # 1chapter, 01-chapter
-        r"(\d+)[_-]?ch",  # 1ch, 01-ch
-        r"(\d{1,4})$",  # ends with 1-4 digits
-        r"(\d+)",  # any number in filename
+        r"chapter[_-]?(\d+)",
+        r"chap[_-]?(\d+)",
+        r"ch[_-]?(\d+)",
+        r"part[_-]?(\d+)",
+        r"(\d+)[_-]?chapter",
+        r"(\d+)[_-]?ch",
+        r"(\d{1,4})$",
+        r"(\d+)",
     ]
 
     for pattern in patterns:
@@ -52,7 +73,6 @@ def extract_chapter_number(filename: str) -> tuple[int, str]:
         if match:
             return (int(match.group(1)), filename)
 
-    # Fallback: no number found, sort to end
     return (float("inf"), filename)
 
 
@@ -64,22 +84,19 @@ def get_spacy_lang(lang):
 
 
 def split_sentence(text, lang="en", text_split_length=250):
-    """Preprocess the input text"""
+    """Preprocess the input text into chunks respecting sentence boundaries."""
     text_splits = []
     if text_split_length is not None and len(text) >= text_split_length:
         text_splits.append("")
         nlp = get_spacy_lang(lang)
-        nlp.max_length = 6000000  # Set the new limit (e.g., 2 million characters)
+        nlp.max_length = 6000000
         nlp.add_pipe("sentencizer")
         doc = nlp(text)
         for sentence in doc.sents:
             if len(text_splits[-1]) + len(str(sentence)) <= text_split_length:
-                # if the last sentence + the current sentence is less than the text_split_length
-                # then add the current sentence to the last sentence
                 text_splits[-1] += " " + str(sentence)
                 text_splits[-1] = text_splits[-1].lstrip()
             elif len(str(sentence)) > text_split_length:
-                # if the current sentence is greater than the text_split_length
                 for line in textwrap.wrap(
                     str(sentence),
                     width=text_split_length,
@@ -91,179 +108,327 @@ def split_sentence(text, lang="en", text_split_length=250):
             else:
                 text_splits.append(str(sentence))
 
-        if len(text_splits) > 1:
-            if text_splits[0] == "":
-                del text_splits[0]
+        if len(text_splits) > 1 and text_splits[0] == "":
+            del text_splits[0]
     else:
         text_splits = [text.lstrip()]
 
     return text_splits
 
 
+def _init_tts_patches():
+    """Apply necessary patches for PyTorch 2.6+ and torchaudio compatibility."""
+    import torch
+
+    _original_torch_load = torch.load
+
+    def _patched_torch_load(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = False
+        return _original_torch_load(*args, **kwargs)
+
+    torch.load = _patched_torch_load
+
+
+def gpu_worker_loop(
+    gpu_id: int,
+    task_queue,  # multiprocessing.Queue
+    result_queue,  # multiprocessing.Queue
+    model_name: str,
+    speaker_id: str,
+):
+    """
+    Persistent worker that loads the model once and processes tasks from the queue.
+
+    This runs in a separate process, one per GPU.
+    """
+    print(f"[GPU {gpu_id}] Worker process started, PID={os.getpid()}", flush=True)
+
+    try:
+        _init_tts_patches()
+
+        import torch
+        from TTS.api import TTS
+
+        # Select the specific GPU device
+        device = f"cuda:{gpu_id}"
+        torch.cuda.set_device(gpu_id)
+
+        gpu_name = torch.cuda.get_device_name(gpu_id)
+        print(f"[GPU {gpu_id}] Using {gpu_name} ({device})", flush=True)
+
+        # Warm up CUDA on correct device
+        _ = torch.zeros(1, device=device)
+
+        print(f"[GPU {gpu_id}] Loading TTS model on CPU first...", flush=True)
+        tts = TTS(model_name=model_name, progress_bar=False, gpu=False)
+
+        # Move model to specific GPU
+        print(f"[GPU {gpu_id}] Moving model to {device}...", flush=True)
+        tts.synthesizer.tts_model.to(device)
+        if hasattr(tts.synthesizer, 'vocoder_model') and tts.synthesizer.vocoder_model is not None:
+            tts.synthesizer.vocoder_model.to(device)
+
+        # Update synthesizer's device reference
+        tts.synthesizer.device = device
+
+        actual_device = next(tts.synthesizer.tts_model.parameters()).device
+        print(f"[GPU {gpu_id}] Model on {actual_device}, ready to process tasks", flush=True)
+    except Exception as e:
+        print(f"[GPU {gpu_id}] FATAL: Failed to initialize: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return
+
+    chunks_processed = 0
+    while True:
+        task: ChunkTask | None = task_queue.get()
+
+        if task is None:
+            print(f"[GPU {gpu_id}] Shutdown signal received. Processed {chunks_processed} chunks.", flush=True)
+            break
+
+        chunks_processed += 1
+        try:
+            tts.tts_to_file(
+                text=task.text,
+                file_path=task.output_path,
+                speaker_wav=speaker_id,
+                language="en",
+            )
+            if chunks_processed % 10 == 0:
+                print(f"[GPU {gpu_id}] Processed {chunks_processed} chunks", flush=True)
+            result = ChunkResult(
+                chapter_name=task.chapter_name,
+                chunk_index=task.chunk_index,
+                output_path=task.output_path,
+                success=True,
+            )
+        except Exception as e:
+            print(f"[GPU {gpu_id}] Error processing chunk: {e}", flush=True)
+            result = ChunkResult(
+                chapter_name=task.chapter_name,
+                chunk_index=task.chunk_index,
+                output_path=task.output_path,
+                success=False,
+                error=str(e),
+            )
+
+        result_queue.put(result)
+
+
 def process_tts_chapters(
     chapters_directory: Path,
     output_dir: Path,
-    num_workers: int,
     model: str,
     speaker: str,
     num_gpus: int = 2,
     workers_per_gpu: int = 1,
-    # replacements_yml_filepath: Path,
 ) -> list[str]:
     """
-    Process multiple chapters using TTS inference.
+    Process multiple chapters using TTS inference with persistent GPU workers.
 
-    :param chapters_directory: The directory containing chapter files to process
-    :type chapters_directory: Path
-    :param output_dir: The directory where output audio files will be saved
-    :type output_dir: Path
-    :param num_workers: The number of worker processes to use for parallel processing
-        (kept for backward compatibility, ignored when num_gpus > 1)
-    :type num_workers: int
-    :param model: The name of the TTS model to use
-    :type model: str
-    :param speaker: The ID or path of the speaker voice to use
-    :type speaker: str
-    :param num_gpus: The number of GPUs to use for parallel processing (default: 2)
-    :type num_gpus: int
-    :param workers_per_gpu: The number of worker processes per GPU (default: 1)
-    :type workers_per_gpu: int
-    :param replacements_yml_filepath: The path to a YAML file containing text replacement rules
-    :type replacements_yml_filepath: Path
-    :return: A list of paths to the generated audio files
-    :rtype: list[str]
+    Each GPU loads the model once and processes multiple chunks, avoiding
+    the overhead of reloading the model for each chapter.
+
+    Chunks are processed individually to prevent OOM issues.
+    Skips chapters that already have output files in output_dir.
     """
-    # preprocess_config = PreprocessConfig().from_yaml(replacements_yml_filepath)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    speaker_name = Path(speaker).stem
+
     chapters = [
         chapter for chapter in chapters_directory.iterdir() if chapter.is_file()
     ]
-    # Sort chapters numerically by filename using robust chapter number extraction
     chapters.sort(key=lambda x: extract_chapter_number(x.name)[0])
 
-    # Debug logging for chapter ordering
+    # Check which chapters already have output files
+    chapters_to_process = []
+    skipped_chapters = []
+    for chapter in chapters:
+        chapter_name = chapter.stem
+        expected_output = output_dir / f"{speaker_name}-{chapter_name}.wav"
+        if expected_output.exists():
+            skipped_chapters.append((chapter, expected_output))
+        else:
+            chapters_to_process.append(chapter)
+
     logging.info("Chapter processing order:")
     for i, chapter in enumerate(chapters):
         chapter_num, _ = extract_chapter_number(chapter.name)
-        logging.info(f"  {i + 1}. {chapter.name} (extracted number: {chapter_num})")
+        status = (
+            "(skipped - already exists)" if chapter not in chapters_to_process else ""
+        )
+        logging.info(
+            f"  {i + 1}. {chapter.name} (extracted number: {chapter_num}) {status}"
+        )
 
-    texts = {}
-    for chapter_file in chapters:
-        with open(chapter_file, "r", encoding="utf-8", errors="replace") as f:
-            text = "".join(f.readlines())
-            text = split_sentence(text, lang="en", text_split_length=399)
-            text = [sentence.lstrip() for sentence in text]
-            # text = preprocess(sentences=text, config=preprocess_config)
-            texts[chapter_file.stem] = "\n".join(text)
+    if skipped_chapters:
+        logging.info(
+            f"Skipping {len(skipped_chapters)} chapters with existing output files"
+        )
 
-    return parallel_tts_inference(
-        texts, output_dir, num_workers, model, speaker, num_gpus, workers_per_gpu
-    )
+    if not chapters_to_process:
+        logging.info("All chapters already processed, nothing to do")
+        return [str(output_dir / f"{speaker_name}-{ch.stem}.wav") for ch in chapters]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        chunks_dir = tmpdir / "chunks"
+        chunks_dir.mkdir()
+
+        # Parse chapters into chunks and create tasks (only for chapters needing processing)
+        all_tasks: list[ChunkTask] = []
+        chapter_chunk_counts: dict[str, int] = {}
+
+        for chapter_file in chapters_to_process:
+            with open(chapter_file, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+
+            chunks = split_sentence(text, lang="en", text_split_length=399)
+            chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
+
+            chapter_name = chapter_file.stem
+            chapter_chunk_counts[chapter_name] = len(chunks)
+
+            for i, chunk_text in enumerate(chunks):
+                task = ChunkTask(
+                    chapter_name=chapter_name,
+                    chunk_index=i,
+                    text=chunk_text,
+                    output_path=str(chunks_dir / f"{chapter_name}_chunk_{i:05d}.wav"),
+                )
+                all_tasks.append(task)
+
+        total_chunks = len(all_tasks)
+        logging.info(
+            f"Created {total_chunks} chunks from {len(chapters_to_process)} chapters"
+        )
+
+        # Sort tasks by text length (longest first) for better load balancing
+        all_tasks.sort(key=lambda t: len(t.text), reverse=True)
+
+        results = _run_persistent_workers(
+            tasks=all_tasks,
+            num_gpus=num_gpus,
+            model_name=model,
+            speaker_id=speaker,
+            workers_per_gpu=workers_per_gpu,
+        )
+
+        failed = [r for r in results if not r.success]
+        if failed:
+            for f in failed:
+                logging.error(
+                    f"Failed chunk: {f.chapter_name} chunk {f.chunk_index}: {f.error}"
+                )
+            raise RuntimeError(f"{len(failed)} chunks failed to process")
+
+        # Combine chunks back into chapter audio files (only for newly processed chapters)
+        output_files = []
+
+        for chapter_file in chapters_to_process:
+            chapter_name = chapter_file.stem
+            chunk_count = chapter_chunk_counts[chapter_name]
+
+            chunk_files = []
+            for i in range(chunk_count):
+                chunk_path = chunks_dir / f"{chapter_name}_chunk_{i:05d}.wav"
+                if chunk_path.exists():
+                    chunk_files.append(chunk_path)
+                else:
+                    logging.warning(f"Missing chunk file: {chunk_path}")
+
+            if not chunk_files:
+                logging.warning(f"No chunks found for chapter {chapter_name}")
+                continue
+
+            combined = AudioSegment.empty()
+            for chunk_file in chunk_files:
+                audio = AudioSegment.from_file(str(chunk_file))
+                combined += audio
+
+            output_path = output_dir / f"{speaker_name}-{chapter_name}.wav"
+            combined.export(str(output_path), format="wav")
+            output_files.append(str(output_path))
+            logging.info(f"Created {output_path} from {len(chunk_files)} chunks")
+
+        # Include already-existing files in the return list
+        for _, existing_output in skipped_chapters:
+            output_files.append(str(existing_output))
+
+        return output_files
 
 
-def parallel_tts_inference(
-    texts: dict[str, str],
-    output_dir: Path,
-    num_workers: int,
+def _terminate_workers(workers: list) -> None:
+    """Terminate all worker processes."""
+    for p in workers:
+        if p.is_alive():
+            p.terminate()
+    for p in workers:
+        p.join(timeout=5)
+        if p.is_alive():
+            p.kill()
+            p.join()
+
+
+def _run_persistent_workers(
+    tasks: list[ChunkTask],
+    num_gpus: int,
     model_name: str,
     speaker_id: str,
-    num_gpus: int = 2,
     workers_per_gpu: int = 1,
-) -> list[str]:
+) -> list[ChunkResult]:
     """
-    Process multiple texts in parallel using TTS inference across multiple GPUs.
+    Run persistent GPU workers that each load the model once and process many tasks.
 
-    :param texts: A dictionary of texts to process, where keys are identifiers and values are the texts
-    :type texts: dict[str, str]
-    :param output_dir: The directory where output audio files will be saved
-    :type output_dir: Path
-    :param num_workers: The number of worker processes to use for parallel processing
-        (kept for backward compatibility, ignored when num_gpus > 1)
-    :type num_workers: int
-    :param model_name: The name of the TTS model to use
-    :type model_name: str
-    :param speaker_id: The ID or path of the speaker voice to use
-    :type speaker_id: str
-    :param num_gpus: The number of GPUs to use for parallel processing (default: 2)
-    :type num_gpus: int
-    :param workers_per_gpu: The number of worker processes per GPU (default: 1)
-    :type workers_per_gpu: int
-    :return: A list of paths to the generated audio files
-    :rtype: list[str]
+    Uses explicit spawn context to ensure CUDA is properly isolated per process.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    name = Path(speaker_id).stem
+    task_queues = [_mp_context.Queue() for _ in range(num_gpus)]
+    result_queue = _mp_context.Queue()
 
-    multiprocessing.set_start_method("spawn", force=True)
+    # Distribute tasks across GPUs round-robin (tasks pre-sorted by length)
+    for i, task in enumerate(tasks):
+        gpu_id = i % num_gpus
+        task_queues[gpu_id].put(task)
 
-    # Split texts across GPUs in round-robin fashion
-    text_items = list(texts.items())
-    gpu_batches: list[list[tuple[str, str]]] = [[] for _ in range(num_gpus)]
-    for i, item in enumerate(text_items):
-        gpu_batches[i % num_gpus].append(item)
+    total_workers = num_gpus * workers_per_gpu
+    logging.info(f"Distributing {len(tasks)} chunks across {num_gpus} GPUs ({workers_per_gpu} workers each, {total_workers} total)")
+    for gpu_id in range(num_gpus):
+        count = sum(1 for j, _ in enumerate(tasks) if j % num_gpus == gpu_id)
+        logging.info(f"  GPU {gpu_id}: {count} chunks, {workers_per_gpu} workers")
 
-    logging.info(f"Distributing {len(text_items)} items across {num_gpus} GPUs")
-    for gpu_id, batch in enumerate(gpu_batches):
-        logging.info(f"  GPU {gpu_id}: {len(batch)} items")
+    workers = []
+    for gpu_id in range(num_gpus):
+        for worker_idx in range(workers_per_gpu):
+            p = _mp_context.Process(
+                target=gpu_worker_loop,
+                args=(gpu_id, task_queues[gpu_id], result_queue, model_name, speaker_id),
+            )
+            p.start()
+            workers.append(p)
 
-    all_futures = []
-    executors: list[ProcessPoolExecutor] = []
-
+    results: list[ChunkResult] = []
     try:
-        # Create a separate process pool for each GPU
+        for i in range(len(tasks)):
+            result = result_queue.get()
+            results.append(result)
+            if (i + 1) % 50 == 0 or (i + 1) == len(tasks):
+                logging.info(f"Progress: {i + 1}/{len(tasks)} chunks completed")
+
+        # Normal shutdown - send one None per worker (multiple workers share each queue)
         for gpu_id in range(num_gpus):
-            executor = ProcessPoolExecutor(max_workers=workers_per_gpu)
-            executors.append(executor)
+            for _ in range(workers_per_gpu):
+                task_queues[gpu_id].put(None)
 
-            for source_file, text in gpu_batches[gpu_id]:
-                future = executor.submit(
-                    tts_worker,
-                    text,
-                    str(output_dir / f"{name}-{source_file}.wav"),
-                    model_name,
-                    speaker_id,
-                    gpu_id,
-                )
-                all_futures.append(future)
+        for p in workers:
+            p.join()
 
-        results = [future.result() for future in as_completed(all_futures)]
-
-    finally:
-        # Ensure all executors are properly shut down
-        for executor in executors:
-            executor.shutdown(wait=True)
+    except KeyboardInterrupt:
+        logging.warning("Interrupted! Terminating worker processes...")
+        _terminate_workers(workers)
+        raise
 
     return results
-
-
-def tts_worker(
-    text: str, output_file: str, model_name: str, speaker_id: str, gpu_id: int = 0
-) -> str:
-    """
-    Generate audio from text using a TTS model and save it to a file.
-
-    :param text: The input text to be converted to speech
-    :type text: str
-    :param output_file: The path where the output audio file will be saved
-    :type output_file: str
-    :param model_name: The name of the TTS model to use
-    :type model_name: str
-    :param speaker_id: The ID or path of the speaker voice to use
-    :type speaker_id: str
-    :param gpu_id: The GPU device ID to use for this worker (default: 0)
-    :type gpu_id: int
-    :return: The path of the saved audio file
-    :rtype: str
-    """
-    # Set which GPU this worker should use before loading the model
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-    tts = TTS(model_name=model_name, progress_bar=False, gpu=True)
-    logging.info("saving to %s on GPU %d", output_file, gpu_id)
-    tts.tts_to_file(
-        text=text,
-        file_path=output_file,
-        speaker_wav=speaker_id,
-        language="en",
-    )
-    logging.info("finished saving to %s", output_file)
-    return output_file

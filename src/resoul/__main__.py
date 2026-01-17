@@ -307,7 +307,7 @@ def query(
 @click.option("--language", default="en", help="Language code")
 @click.option("--device", default=DEVICE, help="Device for processing (cuda:0, cpu)")
 @click.option("--gpus", type=int, default=2, help="Number of GPUs to use")
-@click.option("--workers-per-gpu", type=int, default=1, help="Workers per GPU")
+@click.option("--workers-per-gpu", type=int, default=2, help="Workers per GPU")
 def mp_files(
     input_path: Path,
     output_dir: Path,
@@ -320,40 +320,32 @@ def mp_files(
     """Generate speech using XTTS v2 via mp for multiple files"""
     from resoul.mp_utils import process_tts_chapters
 
-    # Explicitly set GPU count
     process_tts_chapters(
         Path(input_path),
         Path(output_dir),
-        num_workers=2,
         model="tts_models/multilingual/multi-dataset/xtts_v2",
         speaker=reference_audio_path,
         num_gpus=gpus,
         workers_per_gpu=workers_per_gpu,
     )
 
-    # process_tts_chapters(
-    #     chapters_directory=Path(input_path),
-    #     output_dir=Path(output_dir),
-    #     num_workers=5,
-    #     model="tts_models/multilingual/multi-dataset/xtts_v2",
-    #     speaker=reference_audio_path,
-    # )
-
 
 @xtts.command()
 @click.argument("input-path", type=click.Path(exists=True))
 @click.argument("output-dir", type=click.Path())
-@click.argument("num-workers", type=int)
 @click.option("--reference-audio-path", help="Path to speaker reference audio")
 @click.option("--language", default="en", help="Language code")
 @click.option("--device", default=DEVICE, help="Device for processing (cuda:0, cpu)")
+@click.option("--gpus", type=int, default=2, help="Number of GPUs to use")
+@click.option("--workers-per-gpu", type=int, default=1, help="Workers per GPU")
 def mp_file(
     input_path: Path,
     output_dir: Path,
-    num_workers: int,
     reference_audio_path: Path,
     language: str,
     device: str,
+    gpus: int,
+    workers_per_gpu: int,
 ):
     """Generate speech using XTTS v2 via mp for multiple files"""
     import os
@@ -397,9 +389,10 @@ def mp_file(
         process_tts_chapters(
             chapters_directory=Path(tmpdir),
             output_dir=Path(output_tmpdir),
-            num_workers=num_workers,
             model="tts_models/multilingual/multi-dataset/xtts_v2",
             speaker=reference_audio_path,
+            num_gpus=gpus,
+            workers_per_gpu=workers_per_gpu,
         )
 
         # recombine contents of outputdir to just one
