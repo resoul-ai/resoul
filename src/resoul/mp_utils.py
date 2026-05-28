@@ -224,6 +224,7 @@ def process_tts_chapters(
     speaker: str,
     num_gpus: int = 2,
     workers_per_gpu: int = 1,
+    sequential: bool = False,
 ) -> list[str]:
     """
     Process multiple chapters using TTS inference with persistent GPU workers.
@@ -233,6 +234,11 @@ def process_tts_chapters(
 
     Chunks are processed individually to prevent OOM issues.
     Skips chapters that already have output files in output_dir.
+
+    Args:
+        sequential: If True, process chapters one at a time in order (slower but
+                   outputs chapters as they complete). If False (default), process
+                   all chunks across all chapters in parallel for maximum throughput.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -274,12 +280,49 @@ def process_tts_chapters(
         logging.info("All chapters already processed, nothing to do")
         return [str(output_dir / f"{speaker_name}-{ch.stem}.wav") for ch in chapters]
 
+    if sequential:
+        output_files = _process_chapters_sequential(
+            chapters_to_process=chapters_to_process,
+            output_dir=output_dir,
+            speaker_name=speaker_name,
+            model=model,
+            speaker=speaker,
+            num_gpus=num_gpus,
+            workers_per_gpu=workers_per_gpu,
+        )
+    else:
+        output_files = _process_chapters_parallel(
+            chapters_to_process=chapters_to_process,
+            output_dir=output_dir,
+            speaker_name=speaker_name,
+            model=model,
+            speaker=speaker,
+            num_gpus=num_gpus,
+            workers_per_gpu=workers_per_gpu,
+        )
+
+    # Include already-existing files in the return list
+    for _, existing_output in skipped_chapters:
+        output_files.append(str(existing_output))
+
+    return output_files
+
+
+def _process_chapters_parallel(
+    chapters_to_process: list[Path],
+    output_dir: Path,
+    speaker_name: str,
+    model: str,
+    speaker: str,
+    num_gpus: int,
+    workers_per_gpu: int,
+) -> list[str]:
+    """Process all chapters in parallel (chunks from all files mixed together)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         chunks_dir = tmpdir / "chunks"
         chunks_dir.mkdir()
 
-        # Parse chapters into chunks and create tasks (only for chapters needing processing)
         all_tasks: list[ChunkTask] = []
         chapter_chunk_counts: dict[str, int] = {}
 
@@ -303,11 +346,9 @@ def process_tts_chapters(
                 all_tasks.append(task)
 
         total_chunks = len(all_tasks)
-        logging.info(
-            f"Created {total_chunks} chunks from {len(chapters_to_process)} chapters"
-        )
+        logging.info(f"Created {total_chunks} chunks from {len(chapters_to_process)} chapters")
 
-        # Sort tasks by text length (longest first) for better load balancing
+        # Sort by length for load balancing
         all_tasks.sort(key=lambda t: len(t.text), reverse=True)
 
         results = _run_persistent_workers(
@@ -321,14 +362,11 @@ def process_tts_chapters(
         failed = [r for r in results if not r.success]
         if failed:
             for f in failed:
-                logging.error(
-                    f"Failed chunk: {f.chapter_name} chunk {f.chunk_index}: {f.error}"
-                )
+                logging.error(f"Failed chunk: {f.chapter_name} chunk {f.chunk_index}: {f.error}")
             raise RuntimeError(f"{len(failed)} chunks failed to process")
 
-        # Combine chunks back into chapter audio files (only for newly processed chapters)
+        # Combine chunks into chapter audio files
         output_files = []
-
         for chapter_file in chapters_to_process:
             chapter_name = chapter_file.stem
             chunk_count = chapter_chunk_counts[chapter_name]
@@ -338,8 +376,6 @@ def process_tts_chapters(
                 chunk_path = chunks_dir / f"{chapter_name}_chunk_{i:05d}.wav"
                 if chunk_path.exists():
                     chunk_files.append(chunk_path)
-                else:
-                    logging.warning(f"Missing chunk file: {chunk_path}")
 
             if not chunk_files:
                 logging.warning(f"No chunks found for chapter {chapter_name}")
@@ -355,11 +391,106 @@ def process_tts_chapters(
             output_files.append(str(output_path))
             logging.info(f"Created {output_path} from {len(chunk_files)} chunks")
 
-        # Include already-existing files in the return list
-        for _, existing_output in skipped_chapters:
-            output_files.append(str(existing_output))
-
         return output_files
+
+
+def _process_chapters_sequential(
+    chapters_to_process: list[Path],
+    output_dir: Path,
+    speaker_name: str,
+    model: str,
+    speaker: str,
+    num_gpus: int,
+    workers_per_gpu: int,
+) -> list[str]:
+    """Process chapters one at a time in order, outputting each before moving to next."""
+    output_files = []
+
+    # Start workers once, reuse for all chapters
+    task_queues = [_mp_context.Queue() for _ in range(num_gpus)]
+    result_queue = _mp_context.Queue()
+
+    total_workers = num_gpus * workers_per_gpu
+    logging.info(f"Starting {total_workers} workers ({workers_per_gpu} per GPU)")
+
+    workers = []
+    for gpu_id in range(num_gpus):
+        for _ in range(workers_per_gpu):
+            p = _mp_context.Process(
+                target=gpu_worker_loop,
+                args=(gpu_id, task_queues[gpu_id], result_queue, model, speaker),
+            )
+            p.start()
+            workers.append(p)
+
+    try:
+        for chapter_idx, chapter_file in enumerate(chapters_to_process):
+            chapter_name = chapter_file.stem
+            logging.info(f"Processing chapter {chapter_idx + 1}/{len(chapters_to_process)}: {chapter_name}")
+
+            with open(chapter_file, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+
+            chunks = split_sentence(text, lang="en", text_split_length=399)
+            chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
+
+                # Create tasks for this chapter
+                tasks = []
+                for i, chunk_text in enumerate(chunks):
+                    task = ChunkTask(
+                        chapter_name=chapter_name,
+                        chunk_index=i,
+                        text=chunk_text,
+                        output_path=str(tmpdir / f"chunk_{i:05d}.wav"),
+                    )
+                    tasks.append(task)
+
+                # Distribute tasks round-robin
+                for i, task in enumerate(tasks):
+                    gpu_id = i % num_gpus
+                    task_queues[gpu_id].put(task)
+
+                # Collect results
+                results = []
+                for _ in range(len(tasks)):
+                    result = result_queue.get()
+                    results.append(result)
+
+                failed = [r for r in results if not r.success]
+                if failed:
+                    for f in failed:
+                        logging.error(f"Failed chunk {f.chunk_index}: {f.error}")
+                    raise RuntimeError(f"{len(failed)} chunks failed for chapter {chapter_name}")
+
+                # Combine chunks in order
+                combined = AudioSegment.empty()
+                for i in range(len(chunks)):
+                    chunk_path = tmpdir / f"chunk_{i:05d}.wav"
+                    if chunk_path.exists():
+                        audio = AudioSegment.from_file(str(chunk_path))
+                        combined += audio
+
+                output_path = output_dir / f"{speaker_name}-{chapter_name}.wav"
+                combined.export(str(output_path), format="wav")
+                output_files.append(str(output_path))
+                logging.info(f"Completed {chapter_idx + 1}/{len(chapters_to_process)}: {output_path}")
+
+    except KeyboardInterrupt:
+        logging.warning("Interrupted! Terminating workers...")
+        _terminate_workers(workers)
+        raise
+    finally:
+        # Send shutdown signals
+        for gpu_id in range(num_gpus):
+            for _ in range(workers_per_gpu):
+                task_queues[gpu_id].put(None)
+        for p in workers:
+            p.join(timeout=10)
+
+    return output_files
 
 
 def _terminate_workers(workers: list) -> None:

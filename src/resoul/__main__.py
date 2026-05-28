@@ -308,6 +308,12 @@ def query(
 @click.option("--device", default=DEVICE, help="Device for processing (cuda:0, cpu)")
 @click.option("--gpus", type=int, default=2, help="Number of GPUs to use")
 @click.option("--workers-per-gpu", type=int, default=2, help="Workers per GPU")
+@click.option(
+    "--sequential",
+    is_flag=True,
+    default=False,
+    help="Process chapters in order (slower but outputs as it goes)",
+)
 def mp_files(
     input_path: Path,
     output_dir: Path,
@@ -316,6 +322,7 @@ def mp_files(
     device: str,
     gpus: int,
     workers_per_gpu: int,
+    sequential: bool,
 ):
     """Generate speech using XTTS v2 via mp for multiple files"""
     from resoul.mp_utils import process_tts_chapters
@@ -327,6 +334,7 @@ def mp_files(
         speaker=reference_audio_path,
         num_gpus=gpus,
         workers_per_gpu=workers_per_gpu,
+        sequential=sequential,
     )
 
 
