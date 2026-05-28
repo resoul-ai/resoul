@@ -34,3 +34,9 @@ dependencies = [
     "transformers>=4.30.0",
     'python-dotenv',
 ]
+
+# Pin torch to the CUDA 12.8 build. The system driver is 12.8; the default
+# PyPI torch wheel ships cu130 which crashes with "driver too old". cu128
+# wheels are forward-compatible. Matches twice-workspace/backend's pin.
+[tool.uv]
+torch-backend = "cu128"
